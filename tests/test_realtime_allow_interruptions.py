@@ -157,6 +157,39 @@ class TestAllowInterruptionsFalse:
 
         activity._rt_session.interrupt.assert_called_once()
 
+    async def test_interrupt_on_protected_current_speech_changes_nothing(self) -> None:
+        # the raise is the documented contract for an explicit interrupt, but
+        # it must happen before any work: previously the background speeches
+        # were already interrupted by the time it fired, and the queue, the
+        # realtime cancel and the returned future were all skipped
+        session = _make_session(allow_interruptions=True)
+        activity = AgentActivity(MyAgent(), session)
+        activity._rt_session = Mock()
+        background = SpeechHandle.create(allow_interruptions=True)
+        queued = SpeechHandle.create(allow_interruptions=True)
+        activity._current_speech = SpeechHandle.create(allow_interruptions=False)
+        activity._background_speeches.add(background)
+        activity._speech_q.append((0, 0.0, queued))
+
+        with pytest.raises(RuntimeError, match="force=True"):
+            activity.interrupt()
+
+        assert not background.interrupted
+        assert not queued.interrupted
+        activity._rt_session.interrupt.assert_not_called()
+
+    async def test_forced_interrupt_stops_a_protected_current_speech(self) -> None:
+        session = _make_session(allow_interruptions=True)
+        activity = AgentActivity(MyAgent(), session)
+        activity._rt_session = Mock()
+        current = SpeechHandle.create(allow_interruptions=False)
+        activity._current_speech = current
+
+        activity.interrupt(force=True)
+
+        assert current.interrupted
+        activity._rt_session.interrupt.assert_called_once()
+
     async def test_forced_interrupt_still_cancels_the_realtime_generation(self) -> None:
         session = _make_session(allow_interruptions=True)
         activity = AgentActivity(MyAgent(), session)
