@@ -78,6 +78,7 @@ from .generation import (
     _strip_running_tool_calls,
     _TextOutput,
     _time_to_first_sentence,
+    _ToolOutput,
     _TTSGenerationData,
     forward_generation,
     perform_audio_forwarding,
@@ -3092,6 +3093,73 @@ class AgentActivity(RecognitionHooks):
             and tool.info.flags & ToolFlag.IGNORE_ON_ENTER
         ]
 
+    async def _commit_interrupted_tools(
+        self,
+        *,
+        speech_handle: SpeechHandle,
+        exe_task: asyncio.Task[None],
+        tool_output: _ToolOutput,
+        rt_session: llm.RealtimeSession | None = None,
+    ) -> None:
+        """Wait for the tools of an interrupted turn, then commit the results of those that
+        finished (#3702), so the next inference doesn't run them again.
+
+        The wait runs in a task of its own, awaited through a shield: a tool that outlives
+        INTERRUPTION_TIMEOUT gets the generation task cancelled underneath it, and the results
+        must still reach the chat context once the tool returns.
+        """
+
+        @utils.log_exceptions(logger=logger)
+        async def _wait_and_commit() -> None:
+            await utils.aio.cancel_and_wait(exe_task)
+
+            interrupted_calls: list[llm.FunctionCall] = []
+            interrupted_fnc_outputs: list[llm.FunctionCallOutput] = []
+            for sanitized_out in tool_output.output:
+                interrupted_calls.append(sanitized_out.fnc_call)
+                interrupted_fnc_outputs.append(_interrupted_tool_output(sanitized_out))
+
+            if not interrupted_fnc_outputs:
+                return
+
+            self._session.emit(
+                "function_tools_executed",
+                FunctionToolsExecutedEvent(
+                    function_calls=interrupted_calls,
+                    function_call_outputs=interrupted_fnc_outputs,
+                ),
+            )
+
+            if rt_session is None:
+                tool_messages = interrupted_calls + interrupted_fnc_outputs
+                self._agent._chat_ctx.insert(tool_messages)
+                self._session._tool_items_added(tool_messages)
+                return
+
+            # the realtime path records each call as it starts, so only the outputs are new
+            self._agent._chat_ctx.insert(interrupted_fnc_outputs)
+            self._session._tool_items_added(interrupted_fnc_outputs)
+
+            # unlike the pipeline, a realtime model holds the call open server-side
+            chat_ctx = rt_session.chat_ctx.copy()
+            chat_ctx.items.extend(interrupted_fnc_outputs)
+            try:
+                await rt_session.update_chat_ctx(chat_ctx)
+            except llm.RealtimeError as e:
+                logger.warning(
+                    "failed to sync the tool results of an interrupted generation",
+                    extra={"error": str(e)},
+                )
+
+        # not linked to the speech handle, since the interruption timeout cancels every linked
+        # task when it marks the speech done. still a speech task, so drain waits for it, and
+        # tagged with the handle like the generation task for the drain-blocked check
+        task = self._create_speech_task(
+            _wait_and_commit(), name="AgentActivity.commit_interrupted_tools"
+        )
+        _set_activity_task_info(task, speech_handle=speech_handle)
+        await asyncio.shield(task)
+
     @utils.log_exceptions(logger=logger)
     async def _pipeline_reply_task(
         self,
@@ -3587,26 +3655,9 @@ class AgentActivity(RecognitionHooks):
         speech_handle._mark_generation_done()  # mark the playout done before waiting for the tool execution  # noqa: E501
 
         if speech_handle.interrupted:
-            await utils.aio.cancel_and_wait(exe_task)
-
-            # commit results of tools that finished despite the interruption (#3702), so
-            # the next inference doesn't run them again
-            interrupted_calls: list[llm.FunctionCall] = []
-            interrupted_fnc_outputs: list[llm.FunctionCallOutput] = []
-            for sanitized_out in tool_output.output:
-                interrupted_calls.append(sanitized_out.fnc_call)
-                interrupted_fnc_outputs.append(_interrupted_tool_output(sanitized_out))
-
-            if interrupted_tool_messages := interrupted_calls + interrupted_fnc_outputs:
-                self._session.emit(
-                    "function_tools_executed",
-                    FunctionToolsExecutedEvent(
-                        function_calls=interrupted_calls,
-                        function_call_outputs=interrupted_fnc_outputs,
-                    ),
-                )
-                self._agent._chat_ctx.insert(interrupted_tool_messages)
-                self._session._tool_items_added(interrupted_tool_messages)
+            await self._commit_interrupted_tools(
+                speech_handle=speech_handle, exe_task=exe_task, tool_output=tool_output
+            )
             return
 
         # wait for the tool execution to complete
@@ -4257,37 +4308,12 @@ class AgentActivity(RecognitionHooks):
         speech_handle._mark_generation_done()
 
         if speech_handle.interrupted:
-            await utils.aio.cancel_and_wait(exe_task)
-
-            # commit results of tools that finished despite the interruption, as the pipeline
-            # task does. the calls are already recorded, so each one answers or the model waits
-            interrupted_calls: list[llm.FunctionCall] = []
-            interrupted_fnc_outputs: list[llm.FunctionCallOutput] = []
-            for sanitized_out in tool_output.output:
-                interrupted_calls.append(sanitized_out.fnc_call)
-                interrupted_fnc_outputs.append(_interrupted_tool_output(sanitized_out))
-
-            if interrupted_fnc_outputs:
-                self._session.emit(
-                    "function_tools_executed",
-                    FunctionToolsExecutedEvent(
-                        function_calls=interrupted_calls,
-                        function_call_outputs=interrupted_fnc_outputs,
-                    ),
-                )
-                self._agent._chat_ctx.insert(interrupted_fnc_outputs)
-                self._session._tool_items_added(interrupted_fnc_outputs)
-
-                # unlike the pipeline, a realtime model holds the call open server-side
-                chat_ctx = self._rt_session.chat_ctx.copy()
-                chat_ctx.items.extend(interrupted_fnc_outputs)
-                try:
-                    await self._rt_session.update_chat_ctx(chat_ctx)
-                except llm.RealtimeError as e:
-                    logger.warning(
-                        "failed to sync the tool results of an interrupted generation",
-                        extra={"error": str(e)},
-                    )
+            await self._commit_interrupted_tools(
+                speech_handle=speech_handle,
+                exe_task=exe_task,
+                tool_output=tool_output,
+                rt_session=self._rt_session,
+            )
             return
 
         # wait for the tool execution to complete

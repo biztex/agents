@@ -14,7 +14,7 @@ from livekit.agents import Agent, AgentSession, function_tool
 from livekit.agents.llm import FunctionToolCall
 from livekit.agents.voice.agent_activity import AgentActivity
 from livekit.agents.voice.events import FunctionToolsExecutedEvent
-from livekit.agents.voice.speech_handle import SpeechHandle
+from livekit.agents.voice.speech_handle import INTERRUPTION_TIMEOUT, SpeechHandle
 
 from .fake_realtime import run_realtime_tool_turn
 from .fake_session import FakeActions, create_session, run_session
@@ -172,6 +172,36 @@ async def test_tool_results_preserved_when_tool_in_flight_at_interruption() -> N
     _assert_weather_tool_preserved(agent, session)
 
 
+async def test_tool_results_preserved_when_tool_outlives_interruption_timeout() -> None:
+    """The tool is still running when INTERRUPTION_TIMEOUT cancels the interrupted turn:
+    the barge-in is answered without waiting for the tool, whose results must still be
+    committed once it returns."""
+    actions = FakeActions()
+    _weather_tool_turn(actions, tts_duration=10.0)  # playout 3.5s -> 13.5s
+    actions.add_user_speech(5.0, 6.0, "Stop!", stt_delay=0.2)  # interrupts at 5.5s
+    actions.add_llm(content="Okay, stopping.")
+    actions.add_tts(1.0)
+
+    session = create_session(actions)
+    # the tool starts at ~3.4s and is still running when the interruption times out at ~10.5s
+    agent = WeatherAgent(tool_delay=INTERRUPTION_TIMEOUT + 4.0)
+    tool_executed_events: list[FunctionToolsExecutedEvent] = []
+    session.on("function_tools_executed", tool_executed_events.append)
+
+    await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
+
+    _assert_weather_tool_preserved(agent, session)
+    assert len(tool_executed_events) == 1
+    assert tool_executed_events[0].function_calls[0].name == "get_weather"
+    assert not tool_executed_events[0].function_call_outputs[0].reply_required
+
+    # the reply to the barge-in went out while the tool was still running
+    items = session.history.items
+    reply = next(i for i in items if i.type == "message" and i.text_content == "Okay, stopping.")
+    output = next(i for i in items if i.type == "function_call_output")
+    assert items.index(reply) < items.index(output)
+
+
 async def test_handoff_tool_reports_its_cancellation_when_interrupted() -> None:
     """An interrupted handoff is recorded as failed, and the agent does not switch.
 
@@ -256,6 +286,43 @@ async def test_realtime_tool_results_preserved_and_synced_when_interrupted() -> 
         tool_executed_events[0].function_call_outputs[0].output
         == "The weather in Tokyo is sunny today."
     )
+
+    synced = [i for i in model.active_session.chat_ctx.items if i.type == "function_call_output"]
+    assert len(synced) == 1, "the tool output was never synced to the realtime session"
+    assert synced[0].call_id == "1"
+    assert not synced[0].reply_required
+
+
+async def test_realtime_tool_results_synced_when_tool_outlives_interruption_timeout() -> None:
+    """The tool is still running when INTERRUPTION_TIMEOUT cancels the interrupted generation:
+    its result must still be committed and synced, or the session holds the call open forever."""
+
+    class SlowRealtimeWeatherAgent(Agent):
+        def __init__(self) -> None:
+            super().__init__(instructions="You are a helpful assistant.")
+            self.tool_started = asyncio.Event()
+
+        @function_tool
+        async def get_weather(self) -> str:
+            """Called when the user asks about the weather."""
+            self.tool_started.set()
+            await asyncio.sleep(INTERRUPTION_TIMEOUT + 3.0)
+            return "The weather in Tokyo is sunny today."
+
+    agent = SlowRealtimeWeatherAgent()
+    tool_executed_events: list[FunctionToolsExecutedEvent] = []
+    # the interruption lands as soon as the tool starts, and the tool outlives the timeout
+    session, model = await run_realtime_tool_turn(
+        agent,
+        tool_executed=agent.tool_started,
+        interrupt=True,
+        on_session=lambda s: s.on("function_tools_executed", tool_executed_events.append),
+        timeout=INTERRUPTION_TIMEOUT + 5.0,
+    )
+
+    _assert_weather_tool_preserved(agent, session)
+    assert len(tool_executed_events) == 1
+    assert not tool_executed_events[0].function_call_outputs[0].reply_required
 
     synced = [i for i in model.active_session.chat_ctx.items if i.type == "function_call_output"]
     assert len(synced) == 1, "the tool output was never synced to the realtime session"
